@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>屏幕直播</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; background: #111; color: #eee; }
+  button { font-size: 16px; padding: 10px 16px; margin: 4px 4px 4px 0; border: 0; border-radius: 8px; background: #3a7afe; color: #fff; }
+  button:disabled { background: #555; }
+  textarea { width: 100%; height: 90px; box-sizing: border-box; font-size: 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; }
+  video { width: 100%; background: #000; border-radius: 8px; margin-top: 8px; }
+  #status { margin: 8px 0; color: #9cf; }
+  p { line-height: 1.6; margin: 12px 0 4px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h2>屏幕直播</h2>
+<div id="status">请选择身份</div>
+
+<div id="choose">
+  <button id="beHost">我要直播（电脑）</button>
+  <button id="beViewer">我要观看</button>
+</div>
+
+<div id="host" class="hidden">
+  <p>1. 点“开始共享”，选“整个屏幕”，并勾选“共享系统音频”。</p>
+  <button id="startShare">开始共享</button>
+  <p>2. 把连接码发给朋友：</p>
+  <textarea id="offerOut" readonly></textarea>
+  <button data-copy="offerOut">复制连接码</button>
+  <p>3. 粘贴朋友发回的回复码：</p>
+  <textarea id="answerIn"></textarea>
+  <button id="connect">连接</button>
+</div>
+
+<div id="viewer" class="hidden">
+  <p>1. 粘贴主播发来的连接码：</p>
+  <textarea id="offerIn"></textarea>
+  <button id="makeAnswer">生成回复码</button>
+  <p>2. 把回复码发回给主播：</p>
+  <textarea id="answerOut" readonly></textarea>
+  <button data-copy="answerOut">复制回复码</button>
+  <video id="screen" playsinline controls></video>
+</div>
+
+<button id="mute" class="hidden">关闭麦克风</button>
+<audio id="voice"></audio>
+
+<script>
+// STUN 服务器：帮双方找到自己的公网地址。IPv6 直连时用不到。
+const ICE_SERVERS = [{ urls: ['stun:stun.miwifi.com:3478', 'stun:stun.qq.com:3478'] }];
+const VIDEO_BITRATE = 6000000; // 视频码率上限 6 Mbps
+
+const $ = id => document.getElementById(id);
+const setStatus = text => { $('status').textContent = text; };
+const encode = d => btoa(JSON.stringify({ type: d.type, sdp: d.sdp }));
+const decode = s => JSON.parse(atob(s.replace(/\s/g, '')));
+let pc, mic;
+
+function newPeer() {
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    setStatus({
+      connecting: '连接中…',
+      connected: '已连接',
+      disconnected: '连接中断，正在尝试恢复…',
+      failed: '连接失败：双方网络无法直连（需要中转服务器）'
+    }[s] || s);
+  };
+  // 带视频的流是屏幕画面和电脑声音，纯音频的流是对方的麦克风
+  pc.ontrack = e => {
+    const stream = e.streams[0];
+    const el = stream.getVideoTracks().length ? $('screen') : $('voice');
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+      el.play().catch(() => setStatus('点一下页面开始播放'));
+    }
+  };
+}
+
+async function addMic() {
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    mic.getTracks().forEach(t => pc.addTrack(t, mic));
+    $('mute').classList.remove('hidden');
+  } catch (e) {
+    alert('没拿到麦克风权限，只能看不能说话：' + e.message);
+  }
+}
+
+// 等连接地址收集完（最多 3 秒，避免某个 STUN 不通时卡住）
+function waitIce() {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') resolve();
+    });
+    setTimeout(resolve, 3000);
+  });
+}
+
+$('beHost').onclick = () => { $('choose').classList.add('hidden'); $('host').classList.remove('hidden'); setStatus('准备直播'); };
+$('beViewer').onclick = () => { $('choose').classList.add('hidden'); $('viewer').classList.remove('hidden'); setStatus('准备观看'); };
+
+$('startShare').onclick = async () => {
+  try {
+    const screen = await navigator.mediaDevices.getDisplayMedia({
+      video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 60 } },
+      audio: true,
+      systemAudio: 'include'
+    });
+    newPeer();
+    screen.getVideoTracks()[0].contentHint = 'motion'; // 游戏/电影：优先保证流畅
+    screen.getTracks().forEach(t => pc.addTrack(t, screen));
+    await addMic();
+    setStatus('正在生成连接码…');
+    await pc.setLocalDescription(await pc.createOffer());
+    await waitIce();
+    $('offerOut').value = encode(pc.localDescription);
+    $('startShare').disabled = true;
+    setStatus(screen.getAudioTracks().length
+      ? '连接码已生成，发给朋友'
+      : '连接码已生成。注意：没有共享到电脑声音（选“整个屏幕”并勾选“共享系统音频”）');
+  } catch (e) {
+    setStatus('出错：' + e.message);
+  }
+};
+
+$('connect').onclick = async () => {
+  try {
+    await pc.setRemoteDescription(decode($('answerIn').value));
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    const params = sender.getParameters();
+    if (params.encodings[0]) {
+      params.encodings[0].maxBitrate = VIDEO_BITRATE;
+      await sender.setParameters(params);
+    }
+  } catch (e) {
+    setStatus('回复码有误：' + e.message);
+  }
+};
+
+$('makeAnswer').onclick = async () => {
+  try {
+    newPeer();
+    await pc.setRemoteDescription(decode($('offerIn').value));
+    await addMic();
+    setStatus('正在生成回复码…');
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitIce();
+    $('answerOut').value = encode(pc.localDescription);
+    $('makeAnswer').disabled = true;
+    setStatus('回复码已生成，发回给主播');
+  } catch (e) {
+    setStatus('连接码有误：' + e.message);
+  }
+};
+
+$('mute').onclick = () => {
+  const t = mic.getAudioTracks()[0];
+  t.enabled = !t.enabled;
+  $('mute').textContent = t.enabled ? '关闭麦克风' : '打开麦克风';
+};
+
+document.querySelectorAll('[data-copy]').forEach(b => {
+  b.onclick = async () => {
+    const ta = $(b.dataset.copy);
+    try { await navigator.clipboard.writeText(ta.value); }
+    catch { ta.select(); document.execCommand('copy'); }
+    b.textContent = '已复制';
+  };
+});
+
+// 浏览器拦截自动播放时，点一下页面即可开始
+document.addEventListener('click', () => {
+  if ($('screen').srcObject) $('screen').play().catch(() => {});
+  if ($('voice').srcObject) $('voice').play().catch(() => {});
+});
+</script>
+</body>
+</html>
