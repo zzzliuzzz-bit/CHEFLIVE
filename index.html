@@ -33,6 +33,7 @@
 <h2>屏幕直播</h2>
 <div id="status">请选择身份</div>
 <div id="stats"></div>
+<button id="unmute" class="hidden">🔊 点这里开启对方的说话声</button>
 
 <div id="choose">
   <button id="beHost">我要直播（电脑）</button>
@@ -240,7 +241,7 @@ function newPeer() {
     const el = stream.getVideoTracks().length ? $('screen') : $('voice');
     if (el.srcObject !== stream) {
       el.srcObject = stream;
-      el.play().catch(() => setStatus('点一下页面开始播放'));
+      el.play().catch(() => $('unmute').classList.remove('hidden')); // 浏览器不让自动出声：显示按钮让用户点一下
     }
   };
 }
@@ -272,7 +273,18 @@ function waitIce() {
   });
 }
 
+// 主播是否正在给某位朋友直播（连接中断不到 30 秒也算，可能只是网络抖动）
+let offerAt = 0;
+function hostBusy() {
+  if (!pc) return false;
+  const s = pc.connectionState;
+  if (s === 'connected' || s === 'disconnected') return true;
+  if (s === 'new' || s === 'connecting') return Date.now() - offerAt < 20000; // 20 秒内没连上就让给下一位
+  return false; // failed / closed
+}
+
 async function makeOffer() {
+  offerAt = Date.now();
   newPeer();
   screen.getTracks().forEach(t => pc.addTrack(t, screen));
   await addMic();
@@ -355,7 +367,11 @@ $('startShare').onclick = async () => {
         const msg = await rc.open(text);
         if (!screen) return; // 已停止直播
         if (msg.type === 'hello' && msg.from !== hostViewer) {
-          hostViewer = msg.from; // 新朋友（或朋友刷新了页面）：重新建立连接
+          if (hostBusy()) { // 已经有人在看：让后来的人排队
+            mq.publish(rc.topic + '/viewer', await rc.seal({ type: 'busy', to: msg.from }));
+            return;
+          }
+          hostViewer = msg.from;
           setStatus('朋友已打开链接，正在连接…');
           const offer = await makeOffer();
           if (hostViewer === msg.from) mq.publish(rc.topic + '/viewer', await rc.seal({ type: 'offer', to: msg.from, sdp: offer }));
@@ -431,7 +447,9 @@ async function autoWatch(room) {
       try {
         const msg = await rc.open(text);
         if (msg.to !== me || left) return;
-        if (msg.type === 'offer' && !answered) {
+        if (msg.type === 'busy' && !answered) {
+          setStatus('已有其他朋友在观看，正在排队，对方退出后会自动连上…');
+        } else if (msg.type === 'offer' && !answered) {
           answered = true;
           setStatus('正在连接…');
           const answer = await makeAnswerFor(msg.sdp);
@@ -453,11 +471,15 @@ async function autoWatch(room) {
     setStatus('等待主播开播…');
     hello();
 
+    // 提前准备好“我走了”的消息：关页面、刷新时来不及现做，也能马上通知主播把位置让给排队的人
+    const bye = await rc.seal({ type: 'bye', from: me });
+    window.addEventListener('pagehide', () => { if (!left) mq.publish(rc.topic + '/host', bye); });
+
     $('leave').classList.remove('hidden');
-    $('leave').onclick = async () => {
+    $('leave').onclick = () => {
       if (left) return location.reload(); // “重新进入”
       left = true;
-      try { mq.publish(rc.topic + '/host', await rc.seal({ type: 'bye', from: me })); } catch {}
+      mq.publish(rc.topic + '/host', bye);
       mq.close();
       closePeer();
       stopMic();
@@ -553,14 +575,26 @@ setInterval(async () => {
   }
   const local = pair && stats.get(pair.localCandidateId);
   if (local) text += ` · 线路 ${local.candidateType}${local.address && local.address.includes(':') ? '/IPv6' : ''}`;
+  // 语音音量：说话时“我的麦克风”应该跳到几到几十；对方说话时“对方说话”应该跳动
+  const myMic = mic && mic.getAudioTracks()[0];
+  const voice = $('voice').srcObject && $('voice').srcObject.getAudioTracks()[0];
+  let myLevel, theirLevel;
+  stats.forEach(r => {
+    if (r.type === 'media-source' && r.kind === 'audio' && myMic && r.trackIdentifier === myMic.id) myLevel = r.audioLevel;
+    if (r.type === 'inbound-rtp' && r.kind === 'audio' && voice && r.trackIdentifier === voice.id) theirLevel = r.audioLevel;
+  });
+  const pct = x => (x === undefined ? '无' : Math.round(x * 100));
+  text += ` · 我的麦克风 ${myMic && !myMic.enabled ? '已关' : pct(myLevel)} · 对方说话 ${pct(theirLevel)}${$('voice').paused && voice ? '（未播放）' : ''}`;
   $('stats').textContent = text;
 }, 1000);
 
-// 浏览器拦截自动播放时，点一下页面即可开始
-document.addEventListener('click', () => {
-  if ($('screen').srcObject) $('screen').play().catch(() => {});
-  if ($('voice').srcObject) $('voice').play().catch(() => {});
-});
+// 浏览器拦截自动播放时，点一下页面（或开启声音按钮、视频的播放键）即可开始
+function playAll() {
+  const els = [$('screen'), $('voice')].filter(el => el.srcObject);
+  Promise.all(els.map(el => el.play())).then(() => $('unmute').classList.add('hidden')).catch(() => {});
+}
+document.addEventListener('click', playAll);
+$('screen').addEventListener('play', playAll); // 手机上点视频自带的播放键时，顺便把说话声也打开
 </script>
 </body>
 </html>
