@@ -9,10 +9,12 @@
   button { font-size: 16px; padding: 10px 16px; margin: 4px 4px 4px 0; border: 0; border-radius: 8px; background: #3a7afe; color: #fff; }
   button:disabled { background: #555; }
   textarea { width: 100%; height: 90px; box-sizing: border-box; font-size: 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; }
+  #roomLink { height: 48px; font-size: 14px; }
   video { width: 100%; background: #000; border-radius: 8px; margin-top: 8px; }
   #status { margin: 8px 0; color: #9cf; }
   #stats { font-size: 13px; color: #aaa; }
   p { line-height: 1.6; margin: 12px 0 4px; }
+  details { margin-top: 16px; color: #aaa; }
   .hidden { display: none; }
 </style>
 </head>
@@ -23,27 +25,37 @@
 
 <div id="choose">
   <button id="beHost">我要直播（电脑）</button>
-  <button id="beViewer">我要观看</button>
+  <button id="beViewer">我要观看（用连接码）</button>
 </div>
 
 <div id="host" class="hidden">
-  <p>1. 点“开始共享”，选“整个屏幕”，并勾选“共享系统音频”。</p>
+  <p>点“开始共享”，选“整个屏幕”，并勾选“共享系统音频”。</p>
   <button id="startShare">开始共享</button>
-  <p>2. 把连接码发给朋友：</p>
-  <textarea id="offerOut" readonly></textarea>
-  <button data-copy="offerOut">复制连接码</button>
-  <p>3. 粘贴朋友发回的回复码：</p>
-  <textarea id="answerIn"></textarea>
-  <button id="connect">连接</button>
+  <div id="hostReady" class="hidden">
+    <p>把这个链接发给朋友（链接固定不变，朋友收藏后每次直接打开即可）：</p>
+    <textarea id="roomLink" readonly></textarea>
+    <button data-copy="roomLink">复制链接</button>
+    <details>
+      <summary>自动连接不上时：手动连接</summary>
+      <button id="makeCode">生成连接码</button>
+      <textarea id="offerOut" readonly></textarea>
+      <button data-copy="offerOut">复制连接码</button>
+      <p>粘贴朋友发回的回复码：</p>
+      <textarea id="answerIn"></textarea>
+      <button id="connect">连接</button>
+    </details>
+  </div>
 </div>
 
 <div id="viewer" class="hidden">
-  <p>1. 粘贴主播发来的连接码：</p>
-  <textarea id="offerIn"></textarea>
-  <button id="makeAnswer">生成回复码</button>
-  <p>2. 把回复码发回给主播：</p>
-  <textarea id="answerOut" readonly></textarea>
-  <button data-copy="answerOut">复制回复码</button>
+  <div id="viewerManual">
+    <p>1. 粘贴主播发来的连接码：</p>
+    <textarea id="offerIn"></textarea>
+    <button id="makeAnswer">生成回复码</button>
+    <p>2. 把回复码发回给主播：</p>
+    <textarea id="answerOut" readonly></textarea>
+    <button data-copy="answerOut">复制回复码</button>
+  </div>
   <video id="screen" playsinline controls></video>
 </div>
 
@@ -54,14 +66,104 @@
 // STUN 服务器：帮双方找到自己的公网地址。IPv6 直连时用不到。
 const ICE_SERVERS = [{ urls: ['stun:stun.miwifi.com:3478', 'stun:stun.qq.com:3478'] }];
 const VIDEO_BITRATE = 6000000; // 视频码率上限 6 Mbps
+// 免费公共 MQTT 服务，只用来自动交换连接信息，画面和声音不经过它
+const MQTT_URL = 'wss://broker.emqx.io:8084/mqtt';
 
 const $ = id => document.getElementById(id);
 const setStatus = text => { $('status').textContent = text; };
 const encode = d => btoa(JSON.stringify({ type: d.type, sdp: d.sdp }));
 const decode = s => JSON.parse(atob(s.replace(/\s/g, '')));
-let pc, mic;
+const plain = d => ({ type: d.type, sdp: d.sdp });
+let pc, mic, screen, hostViewer, lastBytes = 0;
+
+// ---- MQTT ----
+// 极简 MQTT 3.1.1 客户端（只用 QoS 0 的订阅和发布）
+function mqttConnect(url, onMessage) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, 'mqtt');
+    ws.binaryType = 'arraybuffer';
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    const str = s => { const b = enc.encode(s); return [b.length >> 8, b.length & 255, ...b]; };
+    const send = (head, body) => {
+      const len = [];
+      let n = body.length;
+      do { const d = n % 128; n = Math.floor(n / 128); len.push(n ? d | 128 : d); } while (n);
+      ws.send(new Uint8Array([head, ...len, ...body]));
+    };
+    const client = {
+      subscribe: topic => send(0x82, [0, 1, ...str(topic), 0]),
+      publish: (topic, text) => send(0x30, [...str(topic), ...enc.encode(text)]),
+      close: () => ws.close()
+    };
+    let buf = new Uint8Array(0), ping;
+    ws.onopen = () => send(0x10, [...str('MQTT'), 4, 2, 0, 60, ...str('cl' + Math.random().toString(36).slice(2, 12))]);
+    ws.onmessage = e => {
+      const more = new Uint8Array(e.data), joined = new Uint8Array(buf.length + more.length);
+      joined.set(buf); joined.set(more, buf.length); buf = joined;
+      while (buf.length >= 2) {
+        let len = 0, mul = 1, i = 1, d;
+        do {
+          if (i >= buf.length) return;
+          d = buf[i++]; len += (d & 127) * mul; mul *= 128;
+        } while (d & 128);
+        if (buf.length < i + len) return;
+        const head = buf[0], body = buf.slice(i, i + len);
+        buf = buf.slice(i + len);
+        if (head >> 4 === 2) { // CONNACK
+          if (body[1] !== 0) return reject(new Error('服务拒绝连接'));
+          ping = setInterval(() => ws.send(new Uint8Array([0xC0, 0])), 30000);
+          resolve(client);
+        } else if (head >> 4 === 3) { // PUBLISH
+          const tl = (body[0] << 8) | body[1];
+          const start = 2 + tl + ((head >> 1) & 3 ? 2 : 0);
+          try { onMessage(dec.decode(body.subarray(2, 2 + tl)), dec.decode(body.subarray(start))); } catch {}
+        }
+      }
+    };
+    ws.onerror = () => reject(new Error('连不上自动连接服务'));
+    ws.onclose = () => clearInterval(ping);
+  });
+}
+
+// 房间号只出现在链接的 # 后面：话题名用它的哈希，消息用它加密，
+// 公共服务上的其他人既看不到房间号，也无法冒充朋友连进来
+async function roomCrypto(room) {
+  const hash = async s => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
+  const hex = Array.from(await hash('topic:' + room), b => b.toString(16).padStart(2, '0')).join('');
+  const key = await crypto.subtle.importKey('raw', await hash('key:' + room), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return {
+    topic: 'cheflive/' + hex.slice(0, 32),
+    seal: async obj => {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const data = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(JSON.stringify(obj))));
+      const all = new Uint8Array(12 + data.length); all.set(iv); all.set(data, 12);
+      let s = ''; all.forEach(b => { s += String.fromCharCode(b); });
+      return btoa(s);
+    },
+    open: async text => {
+      const all = Uint8Array.from(atob(text), c => c.charCodeAt(0));
+      const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: all.slice(0, 12) }, key, all.slice(12));
+      return JSON.parse(new TextDecoder().decode(data));
+    }
+  };
+}
+// ---- END MQTT ----
+
+const randomId = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => (b % 36).toString(36)).join('');
+
+function getRoom() {
+  let room;
+  try { room = localStorage.getItem('cheflive-room'); } catch {}
+  if (!room) {
+    room = randomId(16);
+    try { localStorage.setItem('cheflive-room', room); } catch {}
+  }
+  return room;
+}
 
 function newPeer() {
+  if (pc) pc.close();
+  lastBytes = 0;
   pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
@@ -83,16 +185,20 @@ function newPeer() {
   };
 }
 
+// 麦克风只申请一次，之后每次重新连接都复用
 async function addMic() {
-  try {
-    mic = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-    mic.getTracks().forEach(t => pc.addTrack(t, mic));
-    $('mute').classList.remove('hidden');
-  } catch (e) {
-    alert('没拿到麦克风权限，只能看不能说话：' + e.message);
+  if (mic === undefined) {
+    try {
+      mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      $('mute').classList.remove('hidden');
+    } catch (e) {
+      mic = null;
+      alert('没拿到麦克风权限，只能看不能说话：' + e.message);
+    }
   }
+  if (mic) mic.getTracks().forEach(t => pc.addTrack(t, mic));
 }
 
 // 等连接地址收集完（最多 3 秒，避免某个 STUN 不通时卡住）
@@ -106,28 +212,122 @@ function waitIce() {
   });
 }
 
+async function makeOffer() {
+  newPeer();
+  screen.getTracks().forEach(t => pc.addTrack(t, screen));
+  await addMic();
+  await pc.setLocalDescription(await pc.createOffer());
+  await waitIce();
+  return plain(pc.localDescription);
+}
+
+async function makeAnswerFor(offer) {
+  newPeer();
+  await pc.setRemoteDescription(offer);
+  await addMic();
+  await pc.setLocalDescription(await pc.createAnswer());
+  await waitIce();
+  return plain(pc.localDescription);
+}
+
+async function acceptAnswer(answer) {
+  await pc.setRemoteDescription(answer);
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+  const params = sender.getParameters();
+  if (params.encodings[0]) params.encodings[0].maxBitrate = VIDEO_BITRATE;
+  params.degradationPreference = 'balanced'; // 带宽不够时帧率和分辨率一起降，而不是只降分辨率
+  await sender.setParameters(params);
+}
+
 $('beHost').onclick = () => { $('choose').classList.add('hidden'); $('host').classList.remove('hidden'); setStatus('准备直播'); };
 $('beViewer').onclick = () => { $('choose').classList.add('hidden'); $('viewer').classList.remove('hidden'); setStatus('准备观看'); };
 
+// 主播：共享屏幕，然后在房间里等朋友
 $('startShare').onclick = async () => {
   try {
-    const screen = await navigator.mediaDevices.getDisplayMedia({
+    screen = await navigator.mediaDevices.getDisplayMedia({
       video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 60 } },
       audio: true,
       systemAudio: 'include'
     });
-    newPeer();
-    screen.getVideoTracks()[0].contentHint = 'motion'; // 游戏/电影：优先保证流畅
-    screen.getTracks().forEach(t => pc.addTrack(t, screen));
-    await addMic();
+  } catch (e) {
+    return setStatus('出错：' + e.message);
+  }
+  screen.getVideoTracks()[0].contentHint = 'motion'; // 游戏/电影：优先保证流畅
+  $('startShare').disabled = true;
+  const room = getRoom();
+  $('roomLink').value = location.origin + location.pathname + '#' + room;
+  $('hostReady').classList.remove('hidden');
+  const noAudio = screen.getAudioTracks().length ? '' : '（注意：没有共享到电脑声音，要选“整个屏幕”并勾选“共享系统音频”）';
+
+  try {
+    const rc = await roomCrypto(room);
+    const mq = await mqttConnect(MQTT_URL, async (topic, text) => {
+      try {
+        const msg = await rc.open(text);
+        if (msg.type === 'hello' && msg.from !== hostViewer) {
+          hostViewer = msg.from; // 新朋友（或朋友刷新了页面）：重新建立连接
+          setStatus('朋友已打开链接，正在连接…');
+          const offer = await makeOffer();
+          if (hostViewer === msg.from) mq.publish(rc.topic + '/viewer', await rc.seal({ type: 'offer', to: msg.from, sdp: offer }));
+        } else if (msg.type === 'answer' && msg.from === hostViewer && pc.signalingState === 'have-local-offer') {
+          await acceptAnswer(msg.sdp);
+        }
+      } catch {}
+    });
+    mq.subscribe(rc.topic + '/host');
+    setStatus('已开播，把链接发给朋友' + noAudio);
+  } catch (e) {
+    setStatus('自动连接服务不可用，请展开下面的“手动连接”' + noAudio);
+  }
+};
+
+// 朋友：打开带 # 房间号的链接后自动连接
+async function autoWatch(room) {
+  $('choose').classList.add('hidden');
+  $('viewer').classList.remove('hidden');
+  $('viewerManual').classList.add('hidden');
+  setStatus('正在进入房间…');
+  const me = randomId(10);
+  let answered = false;
+  try {
+    const rc = await roomCrypto(room);
+    const mq = await mqttConnect(MQTT_URL, async (topic, text) => {
+      try {
+        const msg = await rc.open(text);
+        if (msg.type !== 'offer' || msg.to !== me || answered) return;
+        answered = true;
+        setStatus('正在连接…');
+        const answer = await makeAnswerFor(msg.sdp);
+        mq.publish(rc.topic + '/host', await rc.seal({ type: 'answer', from: me, sdp: answer }));
+      } catch (e) {
+        setStatus('连接出错：' + e.message + '（刷新页面重试）');
+      }
+    });
+    mq.subscribe(rc.topic + '/viewer');
+    setStatus('等待主播开播…');
+    // 每 3 秒打一次招呼，直到主播回应（主播晚开播也没关系）
+    const hello = async () => {
+      if (answered) return;
+      mq.publish(rc.topic + '/host', await rc.seal({ type: 'hello', from: me }));
+      setTimeout(hello, 3000);
+    };
+    hello();
+  } catch (e) {
+    setStatus('自动连接服务不可用，请让主播用手动连接发连接码');
+    $('viewerManual').classList.remove('hidden');
+  }
+}
+
+if (location.hash.length > 1) autoWatch(location.hash.slice(1));
+
+// ---- 手动连接（备用） ----
+$('makeCode').onclick = async () => {
+  try {
+    hostViewer = null; // 改用手动连接，忽略之前的自动连接
     setStatus('正在生成连接码…');
-    await pc.setLocalDescription(await pc.createOffer());
-    await waitIce();
-    $('offerOut').value = encode(pc.localDescription);
-    $('startShare').disabled = true;
-    setStatus(screen.getAudioTracks().length
-      ? '连接码已生成，发给朋友'
-      : '连接码已生成。注意：没有共享到电脑声音（选“整个屏幕”并勾选“共享系统音频”）');
+    $('offerOut').value = encode(await makeOffer());
+    setStatus('连接码已生成，发给朋友');
   } catch (e) {
     setStatus('出错：' + e.message);
   }
@@ -135,12 +335,7 @@ $('startShare').onclick = async () => {
 
 $('connect').onclick = async () => {
   try {
-    await pc.setRemoteDescription(decode($('answerIn').value));
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    const params = sender.getParameters();
-    if (params.encodings[0]) params.encodings[0].maxBitrate = VIDEO_BITRATE;
-    params.degradationPreference = 'balanced'; // 带宽不够时帧率和分辨率一起降，而不是只降分辨率
-    await sender.setParameters(params);
+    await acceptAnswer(decode($('answerIn').value));
   } catch (e) {
     setStatus('回复码有误：' + e.message);
   }
@@ -148,13 +343,8 @@ $('connect').onclick = async () => {
 
 $('makeAnswer').onclick = async () => {
   try {
-    newPeer();
-    await pc.setRemoteDescription(decode($('offerIn').value));
-    await addMic();
     setStatus('正在生成回复码…');
-    await pc.setLocalDescription(await pc.createAnswer());
-    await waitIce();
-    $('answerOut').value = encode(pc.localDescription);
+    $('answerOut').value = encode(await makeAnswerFor(decode($('offerIn').value)));
     $('makeAnswer').disabled = true;
     setStatus('回复码已生成，发回给主播');
   } catch (e) {
@@ -178,7 +368,6 @@ document.querySelectorAll('[data-copy]').forEach(b => {
 });
 
 // 每秒显示一次画面实际数据，用来判断画质差的原因
-let lastBytes = 0;
 setInterval(async () => {
   if (!pc || pc.connectionState !== 'connected') return;
   const stats = await pc.getStats();
