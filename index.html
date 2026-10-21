@@ -15,6 +15,17 @@
   #stats { font-size: 13px; color: #aaa; }
   p { line-height: 1.6; margin: 12px 0 4px; }
   details { margin-top: 16px; color: #aaa; }
+  #chat { margin-top: 12px; }
+  #chatLog { height: 200px; overflow-y: auto; background: #1a1a1a; border: 1px solid #444; border-radius: 8px; padding: 8px; font-size: 15px; line-height: 1.5; word-break: break-all; }
+  #chatLog .me { color: #9cf; }
+  #chatLog .other { color: #fd6; }
+  #chatLog .sys { color: #888; }
+  #chatBar { display: flex; gap: 6px; margin-top: 6px; }
+  #chatInput { flex: 1; min-width: 0; font-size: 16px; padding: 8px; background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; }
+  #chatBar button { margin: 0; }
+  body.pip { padding: 8px; max-width: none; }
+  .pip #chat { margin: 0; }
+  .pip #chatLog { height: calc(100vh - 76px); font-size: 17px; }
   .hidden { display: none; }
 </style>
 </head>
@@ -31,6 +42,8 @@
 <div id="host" class="hidden">
   <p>点“开始共享”，选“整个屏幕”，并勾选“共享系统音频”。</p>
   <button id="startShare">开始共享</button>
+  <button id="stopLive" class="hidden">停止直播</button>
+  <button id="pipBtn">打开聊天小窗（置顶）</button>
   <div id="hostReady" class="hidden">
     <p>把这个链接发给朋友（链接固定不变，朋友收藏后每次直接打开即可）：</p>
     <textarea id="roomLink" readonly></textarea>
@@ -56,7 +69,18 @@
     <textarea id="answerOut" readonly></textarea>
     <button data-copy="answerOut">复制回复码</button>
   </div>
+  <button id="leave" class="hidden">退出观看</button>
   <video id="screen" playsinline controls></video>
+</div>
+
+<div id="chatHome">
+  <div id="chat" class="hidden">
+    <div id="chatLog"></div>
+    <div id="chatBar">
+      <input id="chatInput" maxlength="200" placeholder="说点什么…" enterkeyhint="send">
+      <button id="chatSend">发送</button>
+    </div>
+  </div>
 </div>
 
 <button id="mute" class="hidden">关闭麦克风</button>
@@ -74,7 +98,39 @@ const setStatus = text => { $('status').textContent = text; };
 const encode = d => btoa(JSON.stringify({ type: d.type, sdp: d.sdp }));
 const decode = s => JSON.parse(atob(s.replace(/\s/g, '')));
 const plain = d => ({ type: d.type, sdp: d.sdp });
-let pc, mic, screen, hostViewer, lastBytes = 0;
+let pc, mic, screen, hostViewer, hostMq, hostRc, lastBytes = 0;
+let role, chat;
+// 聊天框会被搬进置顶小窗，所以提前拿住元素
+const chatBox = $('chat'), chatLog = $('chatLog'), chatInput = $('chatInput');
+
+function addMsg(who, text, cls) {
+  const line = document.createElement('div');
+  line.className = cls;
+  line.textContent = who + '：' + text; // 纯文本显示，对方发来的内容不会被当成网页代码
+  chatLog.append(line);
+  while (chatLog.children.length > 200) chatLog.firstChild.remove();
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+function showChat(r) {
+  role = r;
+  chatBox.classList.remove('hidden');
+}
+
+// Chrome 默认从很低的码率起步、慢慢往上爬；这里让视频一开始就按约 2.5Mbps 发送
+function fastStart(sdp) {
+  const add = 'x-google-start-bitrate=2500';
+  return sdp.split('\r\nm=').map(sec => {
+    if (!sec.startsWith('video')) return sec;
+    for (const [, pt] of sec.matchAll(/a=rtpmap:(\d+) (?:VP8|VP9|H264|AV1)\//g)) {
+      const fmtp = new RegExp(`a=fmtp:${pt} [^\\r\\n]*`);
+      sec = fmtp.test(sec)
+        ? sec.replace(fmtp, line => line + ';' + add)
+        : sec.replace(`a=rtpmap:${pt} `, `a=fmtp:${pt} ${add}\r\na=rtpmap:${pt} `);
+    }
+    return sec;
+  }).join('\r\nm=');
+}
 
 // ---- MQTT ----
 // 极简 MQTT 3.1.1 客户端（只用 QoS 0 的订阅和发布）
@@ -165,6 +221,10 @@ function newPeer() {
   if (pc) pc.close();
   lastBytes = 0;
   pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  // 文字聊天通道：走同一条点对点连接，双方用相同的编号直接对上
+  chat = pc.createDataChannel('chat', { negotiated: true, id: 0 });
+  chat.onopen = () => addMsg('提示', '已连接，可以聊天了', 'sys');
+  chat.onmessage = e => addMsg(role === 'host' ? '朋友' : '主播', String(e.data).slice(0, 200), 'other');
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
     setStatus({
@@ -231,40 +291,69 @@ async function makeAnswerFor(offer) {
 }
 
 async function acceptAnswer(answer) {
-  await pc.setRemoteDescription(answer);
+  await pc.setRemoteDescription({ type: answer.type, sdp: fastStart(answer.sdp) });
   const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
   const params = sender.getParameters();
   if (params.encodings[0]) params.encodings[0].maxBitrate = VIDEO_BITRATE;
-  params.degradationPreference = 'balanced'; // 带宽不够时帧率和分辨率一起降，而不是只降分辨率
+  params.degradationPreference = 'maintain-resolution'; // 带宽不够时先降帧率，保住清晰度
   await sender.setParameters(params);
 }
 
-$('beHost').onclick = () => { $('choose').classList.add('hidden'); $('host').classList.remove('hidden'); setStatus('准备直播'); };
-$('beViewer').onclick = () => { $('choose').classList.add('hidden'); $('viewer').classList.remove('hidden'); setStatus('准备观看'); };
+$('beHost').onclick = () => { $('choose').classList.add('hidden'); $('host').classList.remove('hidden'); showChat('host'); setStatus('准备直播'); };
+$('beViewer').onclick = () => { $('choose').classList.add('hidden'); $('viewer').classList.remove('hidden'); showChat('viewer'); setStatus('准备观看'); };
+
+function sendChat() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  if (!chat || chat.readyState !== 'open') return addMsg('提示', '还没连上，消息发不出去', 'sys');
+  chat.send(text);
+  addMsg('我', text, 'me');
+  chatInput.value = '';
+}
+$('chatSend').onclick = sendChat;
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.isComposing) sendChat(); // isComposing：中文输入法选字时的回车不算发送
+});
+
+// 主播：把聊天框搬进一个置顶小窗，打游戏时也能看到和回复
+$('pipBtn').onclick = async () => {
+  if (!window.documentPictureInPicture) return alert('这个浏览器不支持置顶小窗，请用最新版 Chrome 或 Edge');
+  const pip = await documentPictureInPicture.requestWindow({ width: 340, height: 420 });
+  const style = pip.document.createElement('style');
+  style.textContent = document.querySelector('style').textContent;
+  pip.document.head.append(style);
+  pip.document.body.classList.add('pip');
+  pip.document.body.append(chatBox);
+  pip.addEventListener('pagehide', () => $('chatHome').append(chatBox)); // 关掉小窗后放回原页面
+  chatLog.scrollTop = chatLog.scrollHeight;
+};
 
 // 主播：共享屏幕，然后在房间里等朋友
 $('startShare').onclick = async () => {
   try {
     screen = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 60 } },
+      video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 30 } }, // 30 帧：同样带宽下每帧更清楚
       audio: true,
       systemAudio: 'include'
     });
   } catch (e) {
     return setStatus('出错：' + e.message);
   }
-  screen.getVideoTracks()[0].contentHint = 'motion'; // 游戏/电影：优先保证流畅
+  screen.getVideoTracks()[0].contentHint = 'motion';
+  screen.getVideoTracks()[0].onended = stopLive; // 点了浏览器自带的“停止共享”
   $('startShare').disabled = true;
+  $('stopLive').classList.remove('hidden');
   const room = getRoom();
   $('roomLink').value = location.origin + location.pathname + '#' + room;
   $('hostReady').classList.remove('hidden');
   const noAudio = screen.getAudioTracks().length ? '' : '（注意：没有共享到电脑声音，要选“整个屏幕”并勾选“共享系统音频”）';
 
   try {
-    const rc = await roomCrypto(room);
-    const mq = await mqttConnect(MQTT_URL, async (topic, text) => {
+    const rc = hostRc = await roomCrypto(room);
+    const mq = hostMq = await mqttConnect(MQTT_URL, async (topic, text) => {
       try {
         const msg = await rc.open(text);
+        if (!screen) return; // 已停止直播
         if (msg.type === 'hello' && msg.from !== hostViewer) {
           hostViewer = msg.from; // 新朋友（或朋友刷新了页面）：重新建立连接
           setStatus('朋友已打开链接，正在连接…');
@@ -272,6 +361,10 @@ $('startShare').onclick = async () => {
           if (hostViewer === msg.from) mq.publish(rc.topic + '/viewer', await rc.seal({ type: 'offer', to: msg.from, sdp: offer }));
         } else if (msg.type === 'answer' && msg.from === hostViewer && pc.signalingState === 'have-local-offer') {
           await acceptAnswer(msg.sdp);
+        } else if (msg.type === 'bye' && msg.from === hostViewer) {
+          hostViewer = null;
+          closePeer();
+          setStatus('朋友已退出观看，直播仍在进行，等待朋友重新进入…');
         }
       } catch {}
     });
@@ -282,37 +375,97 @@ $('startShare').onclick = async () => {
   }
 };
 
+function closePeer() {
+  if (pc) pc.close();
+  pc = null;
+  $('stats').textContent = '';
+}
+
+function stopMic() {
+  if (mic) mic.getTracks().forEach(t => t.stop());
+  mic = undefined;
+  $('mute').classList.add('hidden');
+  $('mute').textContent = '关闭麦克风';
+}
+
+// 主播：停止直播（通知朋友、关闭连接、停止录屏和麦克风）
+async function stopLive() {
+  if (!screen) return;
+  const s = screen;
+  screen = null;
+  if (hostMq && hostViewer) {
+    try { hostMq.publish(hostRc.topic + '/viewer', await hostRc.seal({ type: 'bye', to: hostViewer })); } catch {}
+  }
+  if (hostMq) hostMq.close();
+  hostMq = null;
+  hostViewer = null;
+  s.getTracks().forEach(t => t.stop());
+  closePeer();
+  stopMic();
+  $('voice').srcObject = null;
+  $('stopLive').classList.add('hidden');
+  $('hostReady').classList.add('hidden');
+  $('startShare').disabled = false;
+  setStatus('直播已停止。朋友的链接不变，下次点“开始共享”即可');
+}
+$('stopLive').onclick = stopLive;
+
 // 朋友：打开带 # 房间号的链接后自动连接
 async function autoWatch(room) {
   $('choose').classList.add('hidden');
   $('viewer').classList.remove('hidden');
   $('viewerManual').classList.add('hidden');
+  showChat('viewer');
   setStatus('正在进入房间…');
   const me = randomId(10);
-  let answered = false;
+  let answered = false, left = false;
   try {
     const rc = await roomCrypto(room);
+    // 每 3 秒打一次招呼，直到主播回应（主播晚开播也没关系）
+    const hello = async () => {
+      if (answered || left) return;
+      mq.publish(rc.topic + '/host', await rc.seal({ type: 'hello', from: me }));
+      setTimeout(hello, 3000);
+    };
     const mq = await mqttConnect(MQTT_URL, async (topic, text) => {
       try {
         const msg = await rc.open(text);
-        if (msg.type !== 'offer' || msg.to !== me || answered) return;
-        answered = true;
-        setStatus('正在连接…');
-        const answer = await makeAnswerFor(msg.sdp);
-        mq.publish(rc.topic + '/host', await rc.seal({ type: 'answer', from: me, sdp: answer }));
+        if (msg.to !== me || left) return;
+        if (msg.type === 'offer' && !answered) {
+          answered = true;
+          setStatus('正在连接…');
+          const answer = await makeAnswerFor(msg.sdp);
+          mq.publish(rc.topic + '/host', await rc.seal({ type: 'answer', from: me, sdp: answer }));
+        } else if (msg.type === 'bye') {
+          // 主播停播：断开，并继续等待，主播重新开播后自动连上
+          closePeer();
+          $('screen').srcObject = null;
+          $('voice').srcObject = null;
+          answered = false;
+          setStatus('主播已停止直播，等待重新开播…');
+          hello();
+        }
       } catch (e) {
         setStatus('连接出错：' + e.message + '（刷新页面重试）');
       }
     });
     mq.subscribe(rc.topic + '/viewer');
     setStatus('等待主播开播…');
-    // 每 3 秒打一次招呼，直到主播回应（主播晚开播也没关系）
-    const hello = async () => {
-      if (answered) return;
-      mq.publish(rc.topic + '/host', await rc.seal({ type: 'hello', from: me }));
-      setTimeout(hello, 3000);
-    };
     hello();
+
+    $('leave').classList.remove('hidden');
+    $('leave').onclick = async () => {
+      if (left) return location.reload(); // “重新进入”
+      left = true;
+      try { mq.publish(rc.topic + '/host', await rc.seal({ type: 'bye', from: me })); } catch {}
+      mq.close();
+      closePeer();
+      stopMic();
+      $('screen').srcObject = null;
+      $('voice').srcObject = null;
+      $('leave').textContent = '重新进入';
+      setStatus('已退出观看');
+    };
   } catch (e) {
     setStatus('自动连接服务不可用，请让主播用手动连接发连接码');
     $('viewerManual').classList.remove('hidden');
@@ -347,6 +500,16 @@ $('makeAnswer').onclick = async () => {
     $('answerOut').value = encode(await makeAnswerFor(decode($('offerIn').value)));
     $('makeAnswer').disabled = true;
     setStatus('回复码已生成，发回给主播');
+    $('leave').classList.remove('hidden');
+    $('leave').onclick = () => {
+      closePeer();
+      stopMic();
+      $('screen').srcObject = null;
+      $('voice').srcObject = null;
+      $('leave').classList.add('hidden');
+      $('makeAnswer').disabled = false;
+      setStatus('已退出观看');
+    };
   } catch (e) {
     setStatus('连接码有误：' + e.message);
   }
