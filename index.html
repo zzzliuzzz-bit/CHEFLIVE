@@ -11,6 +11,7 @@
   textarea { width: 100%; height: 90px; box-sizing: border-box; font-size: 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 8px; }
   video { width: 100%; background: #000; border-radius: 8px; margin-top: 8px; }
   #status { margin: 8px 0; color: #9cf; }
+  #stats { font-size: 13px; color: #aaa; }
   p { line-height: 1.6; margin: 12px 0 4px; }
   .hidden { display: none; }
 </style>
@@ -18,6 +19,7 @@
 <body>
 <h2>屏幕直播</h2>
 <div id="status">请选择身份</div>
+<div id="stats"></div>
 
 <div id="choose">
   <button id="beHost">我要直播（电脑）</button>
@@ -136,10 +138,9 @@ $('connect').onclick = async () => {
     await pc.setRemoteDescription(decode($('answerIn').value));
     const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
     const params = sender.getParameters();
-    if (params.encodings[0]) {
-      params.encodings[0].maxBitrate = VIDEO_BITRATE;
-      await sender.setParameters(params);
-    }
+    if (params.encodings[0]) params.encodings[0].maxBitrate = VIDEO_BITRATE;
+    params.degradationPreference = 'balanced'; // 带宽不够时帧率和分辨率一起降，而不是只降分辨率
+    await sender.setParameters(params);
   } catch (e) {
     setStatus('回复码有误：' + e.message);
   }
@@ -175,6 +176,33 @@ document.querySelectorAll('[data-copy]').forEach(b => {
     b.textContent = '已复制';
   };
 });
+
+// 每秒显示一次画面实际数据，用来判断画质差的原因
+let lastBytes = 0;
+setInterval(async () => {
+  if (!pc || pc.connectionState !== 'connected') return;
+  const stats = await pc.getStats();
+  let v, pair;
+  stats.forEach(r => {
+    if (r.kind === 'video' && (r.type === 'inbound-rtp' || r.type === 'outbound-rtp')) v = r;
+    if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r;
+  });
+  if (!v) return;
+  const bytes = v.type === 'inbound-rtp' ? v.bytesReceived : v.bytesSent;
+  const kbps = Math.round((bytes - lastBytes) * 8 / 1000);
+  lastBytes = bytes;
+  let text = `${v.frameWidth || '?'}×${v.frameHeight || '?'} · ${Math.round(v.framesPerSecond || 0)}fps · ${kbps}kbps`;
+  if (v.type === 'inbound-rtp') {
+    const total = v.packetsLost + v.packetsReceived;
+    text += ` · 丢包 ${total ? (v.packetsLost / total * 100).toFixed(1) : 0}%`;
+  } else {
+    text += ` · 限制原因 ${v.qualityLimitationReason}`;
+    if (pair && pair.availableOutgoingBitrate) text += ` · 估算可用带宽 ${Math.round(pair.availableOutgoingBitrate / 1000)}kbps`;
+  }
+  const local = pair && stats.get(pair.localCandidateId);
+  if (local) text += ` · 线路 ${local.candidateType}${local.address && local.address.includes(':') ? '/IPv6' : ''}`;
+  $('stats').textContent = text;
+}, 1000);
 
 // 浏览器拦截自动播放时，点一下页面即可开始
 document.addEventListener('click', () => {
